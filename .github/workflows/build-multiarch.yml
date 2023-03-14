@@ -1,0 +1,188 @@
+name: Test and Build multi-architecture
+on:
+  push:
+    branches:
+      - master
+      - test/**
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "examples/**"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # NOTE: the "latest" variant is identified in the Docker meta step's 'latest' config
+        variant:
+          - java19
+          - java17
+          - java17-graalvm-ce
+          - java17-jdk
+          - java17-openj9
+          - java17-alpine
+          - java8
+          - java8-graalvm-ce
+          - java8-multiarch
+          - java8-openj9
+          - java8-jdk
+          - java11
+          - java11-openj9
+          - java11-jdk
+        include:
+        # JAVA 19:
+          - variant: java19
+            baseImage: eclipse-temurin:19-jre-jammy
+            platforms: linux/amd64,linux/arm/v7,linux/arm64
+            mcVersion: 1.19.3
+        # JAVA 17:
+          - variant: java17
+            # jammy doesn't work until minecraft updates to https://github.com/netty/netty/issues/12343
+            baseImage: eclipse-temurin:17-jre-focal
+            platforms: linux/amd64,linux/arm/v7,linux/arm64
+            mcVersion: 1.18.2
+          - variant: java17-graalvm-ce
+            baseImage: ghcr.io/graalvm/graalvm-ce:ol8-java17
+            platforms: linux/amd64,linux/arm64
+            mcVersion: 1.18.2
+          - variant: java17-jdk
+            baseImage: eclipse-temurin:17-focal
+            platforms: linux/amd64,linux/arm/v7,linux/arm64
+            mcVersion: 1.18.2
+          - variant: java17-openj9
+            baseImage: ibm-semeru-runtimes:open-17-jre
+            platforms: linux/amd64,linux/arm64
+            mcVersion: 1.18.2
+          - variant: java17-alpine
+            baseImage: eclipse-temurin:17-jre-alpine
+            platforms: linux/amd64
+            mcVersion: 1.18.2
+        # JAVA 11:
+          - variant: java11
+            baseImage: adoptopenjdk:11-jre-hotspot
+            platforms: linux/amd64,linux/arm/v7,linux/arm64
+            mcVersion: 1.16.5
+          - variant: java11-jdk
+            baseImage: adoptopenjdk:11-jdk-hotspot
+            platforms: linux/amd64,linux/arm/v7,linux/arm64
+            mcVersion: 1.16.5
+          - variant: java11-openj9
+            baseImage: ibm-semeru-runtimes:open-11-jre
+            platforms: linux/amd64,linux/arm64
+            mcVersion: 1.16.5
+        # JAVA 8: NOTE: Unable to go past 8u312 because of Forge dependencies
+          - variant: java8
+            baseImage: openjdk:8-jre-alpine3.9
+            platforms: linux/amd64
+            mcVersion: 1.12.2
+          - variant: java8-graalvm-ce
+            baseImage: ghcr.io/graalvm/graalvm-ce:java8
+            platforms: linux/amd64
+            mcVersion: 1.12.2
+          - variant: java8-multiarch
+            baseImage: eclipse-temurin:8u312-b07-jre-focal
+            platforms: linux/amd64,linux/arm/v7,linux/arm64
+            mcVersion: 1.12.2
+          - variant: java8-jdk
+            baseImage: eclipse-temurin:8u312-b07-jdk-focal
+            platforms: linux/amd64,linux/arm64
+            mcVersion: 1.12.2
+          - variant: java8-openj9
+            baseImage: ibm-semeru-runtimes:open-8u312-b07-jre
+            platforms: linux/amd64,linux/arm64
+            mcVersion: 1.12.2
+    env:
+      IMAGE_TO_TEST: ${{ github.repository_owner }}/minecraft-server:test-${{ matrix.variant }}-${{ github.run_id }}
+      HAS_IMAGE_REPO_ACCESS: ${{ secrets.DOCKER_USER != '' && secrets.DOCKER_PASSWORD != '' }}
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          # for build-files step
+          fetch-depth: 0
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          # NOTE for forks: if your Docker Hub organization doesn't match your Github repo's,
+          # then the use of ${{ github.repository_owner }} will need to be replaced.
+          images: |
+            ${{ github.repository_owner }}/minecraft-server
+          tags: |
+            type=ref,event=tag,enable=${{ matrix.variant == 'java17' }}
+            type=ref,event=tag,suffix=-${{ matrix.variant }}
+            type=raw,value=${{ matrix.variant }}
+          # NOTE this identifies which variant will be published as "latest", which isn't
+          # necessarily the newest version of Java
+          flavor: |
+            latest=${{ matrix.variant == 'java17' }}
+          labels: |
+            org.opencontainers.image.authors=Geoff Bourne <itzgeoff@gmail.com>
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2.1.0
+
+      - name: Build for test
+        uses: docker/build-push-action@v3.3.0
+        with:
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_TO_TEST }}
+          # ensure latest base image is used
+          pull: true
+          # load into daemon for test usage in next step
+          load: true
+          push: false
+          build-args: |
+            BASE_IMAGE=${{ matrix.baseImage }}
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          # no cache-to to avoid cross-cache update from next build step
+
+      - name: Run tests
+        env:
+          MINECRAFT_VERSION: ${{ matrix.mcVersion }}
+          VARIANT: ${{ matrix.variant }}
+          MODS_FORGEAPI_KEY: ${{ secrets.MODS_FORGEAPI_KEY }}
+        run: |
+          tests/test.sh
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        if: env.HAS_IMAGE_REPO_ACCESS
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v3.3.0
+        if: github.actor == github.repository_owner
+        with:
+          platforms: ${{ matrix.platforms }}
+          push: >
+            ${{ 
+            github.ref_type == 'tag' 
+            || github.ref_name == 'master' 
+            || ( github.event_name == 'pull_request' 
+                 && env.HAS_IMAGE_REPO_ACCESS 
+                 && contains(github.event.pull_request.labels.*.name, 'ci/push-image') 
+               )
+            }}
+          tags: ${{ steps.meta.outputs.tags }}
+          # ensure latest base image is used
+          pull: true
+          labels: ${{ steps.meta.outputs.labels }}
+          # Since some consumers, like Watchtower are broken https://github.com/containrrr/watchtower/discussions/1529
+          # Also refer to https://github.com/docker/build-push-action/releases/tag/v3.3.0
+          provenance: false
+          build-args: |
+            BASE_IMAGE=${{ matrix.baseImage }}
+            BUILD_FILES_REV=${{ steps.build-files-rev.outputs.REV }}
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
